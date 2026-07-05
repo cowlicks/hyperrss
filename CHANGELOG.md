@@ -16,4 +16,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 <!-- next-url -->
-[Unreleased]: https://github.com/cowlicks/hrss/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/cowlicks/hyperrss/compare/v0.1.0...HEAD
