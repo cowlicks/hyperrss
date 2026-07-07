@@ -13,6 +13,7 @@ use hyperbee::{
     prefixed::{Prefixed, PrefixedConfig},
     traverse::{TraverseConfigBuilder, TraverseConfigBuilderError},
 };
+use hypercore_handshake::CipherTrait;
 use thiserror::Error;
 
 use crate::const_::RSS_METADATA_FIELDS;
@@ -82,6 +83,11 @@ impl OrderedHyperbee {
     /// The number of blocks in the underlying Hypercore.
     pub async fn version(&self) -> u64 {
         self.bee.version().await
+    }
+
+    /// Add a replication stream for the underlying Hypercore.
+    pub async fn add_stream(&self, stream: impl CipherTrait + 'static) -> Result<(), FeedError> {
+        Ok(self.bee.add_stream(stream).await?)
     }
 
     fn key_sub(&self) -> Prefixed {

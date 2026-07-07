@@ -13,5 +13,7 @@
 
 mod const_;
 mod feed;
+mod peer;
 
 pub use feed::{FeedEntry, FeedError, OrderedHyperbee};
+pub use peer::{Peer, PeerError};

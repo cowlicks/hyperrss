@@ -7,10 +7,21 @@ edition = "2024"
 tracing = "0.1.40"
 futures-lite = "2"
 thiserror = "1"
+hypercore_handshake = "0.6.0"
 
 [dependencies.hyperbee]
 path = "../bee"
 default-features = false
 
+[dependencies.hypercore]
+path = "../core"
+default-features = false
+features = ["sparse", "replication"]
+
+[dependencies.corestore]
+path = "../corestore"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+uint24le_framing = "0.2.0"
