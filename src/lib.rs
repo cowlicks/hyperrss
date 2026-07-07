@@ -13,7 +13,9 @@
 
 mod const_;
 mod feed;
+mod keyed_blobs;
 mod peer;
 
 pub use feed::{FeedEntry, FeedError, OrderedHyperbee};
+pub use keyed_blobs::{KeyedBlobs, KeyedBlobsError};
 pub use peer::{Peer, PeerError};
