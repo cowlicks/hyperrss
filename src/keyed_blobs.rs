@@ -11,6 +11,7 @@ use hyperblobs::{
     GetOptions, Hyperblobs, HyperblobsBuilder, HyperblobsBuilderError, PutBlob, PutOptions,
 };
 use hypercore::Hypercore;
+use hypercore_handshake::CipherTrait;
 use thiserror::Error;
 
 /// Errors produced by [`KeyedBlobs`].
@@ -59,6 +60,22 @@ impl KeyedBlobs {
         let blob_keys = store.get_from_name("blobKeys").await?;
         let blobs = store.get_from_name("blobs").await?;
         Self::from_hypercores(blob_keys, blobs)
+    }
+
+    /// Add a replication stream for the `blobKeys` core.
+    pub async fn add_blob_keys_stream(
+        &self,
+        stream: impl CipherTrait + 'static,
+    ) -> Result<(), KeyedBlobsError> {
+        Ok(self.keys.add_stream(stream).await?)
+    }
+
+    /// Add a replication stream for the `blobs` core.
+    pub async fn add_blobs_stream(
+        &self,
+        stream: impl CipherTrait + 'static,
+    ) -> Result<(), KeyedBlobsError> {
+        Ok(self.blobs.add_stream(stream).await?)
     }
 
     fn decode_id(key: &[u8], value: Option<Vec<u8>>) -> Result<PutBlob, KeyedBlobsError> {
