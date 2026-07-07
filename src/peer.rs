@@ -10,8 +10,10 @@
 //! learns the rest by replicating and reading it — mirroring JS `writer.js`'s bootstrap append and
 //! `reader.js`'s `keysCore.get(0)`.
 //!
-//! Because `corestore`'s connection multiplexing isn't built yet (see `TODO.md`), each of the 4
-//! cores replicates over its own stream rather than one shared connection.
+//! All 4 cores replicate over one physical connection, multiplexed via
+//! [`Corestore::replicate`] — a [`Peer::reader`] can open the `feed`/`blobKeys`/`blobs` cores
+//! *after* the connection is already running (once it learns their keys from the `keys` core),
+//! and they still attach to that same connection automatically.
 
 use std::time::Duration;
 
@@ -122,6 +124,7 @@ impl TryFrom<RawPeerKeys> for PeerKeys {
 /// replaces JS's separate `Writer`/`Reader` types.
 #[derive(Debug)]
 pub struct Peer {
+    store: Corestore,
     keys: PeerKeys,
     keys_core: Hypercore,
     is_writer: bool,
@@ -153,25 +156,25 @@ impl Peer {
             keys_core.append(&bytes).await?;
         }
 
-        Self::from_hypercores(feed_hc, blob_keys_hc, blobs_hc, keys_core, keys)
+        Self::from_hypercores(store.clone(), feed_hc, blob_keys_hc, blobs_hc, keys_core, keys)
     }
 
-    /// Bootstrap a reader from just the `keys` core's public key: opens that core, replicates it
-    /// over `keys_stream`, then waits for the writer's bootstrap entry to learn the other 3
-    /// cores' public keys (JS: `reader.js`'s `keysCore.get(0)`).
+    /// Bootstrap a reader from just the `keys` core's public key: opens that core, starts
+    /// multiplexed replication over `stream` (see [`Peer::add_stream`]), then waits for the
+    /// writer's bootstrap entry to learn the other 3 cores' public keys (JS: `reader.js`'s
+    /// `keysCore.get(0)`). The `feed`/`blobKeys`/`blobs` cores, opened only *after* this point,
+    /// attach to this same already-running connection automatically — no extra streams needed.
     ///
     /// This waits with no internal timeout, matching JS's plain `await`; wrap the call in
-    /// [`tokio::time::timeout`] if you want one. After this returns, the feed/`blobKeys`/`blobs`
-    /// cores still each need their own `add_stream`/`add_blob_keys_stream`/`add_blobs_stream`
-    /// call — see the [module docs](self).
+    /// [`tokio::time::timeout`] if you want one.
     pub async fn reader(
         store: &Corestore,
         keys_core_public_key: VerifyingKey,
-        keys_stream: impl CipherTrait + 'static,
+        stream: impl CipherTrait + 'static,
     ) -> Result<Self, PeerError> {
         let keys_core = store.get_from_verifying_key(&keys_core_public_key).await?;
         // TODO(spawn): tracked in ../../TODO.md alongside the other `add_stream` spawn sites.
-        tokio::spawn(keys_core.replicate(keys_stream));
+        tokio::spawn(store.replicate(stream));
 
         let keys = loop {
             if let Some(bytes) = keys_core.get(0).await? {
@@ -185,10 +188,11 @@ impl Peer {
         let blob_keys_hc = store.get_from_verifying_key(&keys.blob_keys).await?;
         let blobs_hc = store.get_from_verifying_key(&keys.blobs).await?;
 
-        Self::from_hypercores(feed_hc, blob_keys_hc, blobs_hc, keys_core, keys)
+        Self::from_hypercores(store.clone(), feed_hc, blob_keys_hc, blobs_hc, keys_core, keys)
     }
 
     fn from_hypercores(
+        store: Corestore,
         feed_hc: Hypercore,
         blob_keys_hc: Hypercore,
         blobs_hc: Hypercore,
@@ -200,6 +204,7 @@ impl Peer {
         let feed = OrderedHyperbee::new(Hyperbee::from_hypercore(feed_hc)?);
         let keyed_blobs = KeyedBlobs::from_hypercores(blob_keys_hc, blobs_hc)?;
         Ok(Self {
+            store,
             keys,
             keys_core,
             is_writer,
@@ -229,30 +234,13 @@ impl Peer {
         self.keys_core.key_pair().public
     }
 
-    /// Add a replication stream for the `keys` core, so a connecting [`Peer::reader`] can fetch
-    /// this peer's public keys.
-    pub async fn add_keys_stream(&self, stream: impl CipherTrait + 'static) -> Result<(), PeerError> {
-        // TODO(spawn): tracked in ../../TODO.md alongside the other `add_stream` spawn sites.
-        tokio::spawn(self.keys_core.replicate(stream));
-        Ok(())
-    }
-
-    /// Add a replication stream for the feed core.
+    /// Add a replication connection for this peer: every core currently open (and any opened
+    /// later) is multiplexed over `stream` via [`Corestore::replicate`]. Call this once per
+    /// physical connection (e.g. once per incoming swarm connection).
     pub async fn add_stream(&self, stream: impl CipherTrait + 'static) -> Result<(), PeerError> {
-        Ok(self.feed.add_stream(stream).await?)
-    }
-
-    /// Add a replication stream for the `blobKeys` core.
-    pub async fn add_blob_keys_stream(
-        &self,
-        stream: impl CipherTrait + 'static,
-    ) -> Result<(), PeerError> {
-        Ok(self.keyed_blobs.add_blob_keys_stream(stream).await?)
-    }
-
-    /// Add a replication stream for the `blobs` core.
-    pub async fn add_blobs_stream(&self, stream: impl CipherTrait + 'static) -> Result<(), PeerError> {
-        Ok(self.keyed_blobs.add_blobs_stream(stream).await?)
+        // TODO(spawn): tracked in ../../TODO.md alongside the other `add_stream` spawn sites.
+        tokio::spawn(self.store.replicate(stream));
+        Ok(())
     }
 
     /// The peer's feed.
@@ -294,28 +282,16 @@ mod test {
         (initiator, responder)
     }
 
-    /// Connect a fresh writer and reader `Peer`, replicating all 4 cores (`keys`, `feed`,
-    /// `blobKeys`, `blobs`), each over its own stream.
+    /// Connect a fresh writer and reader `Peer` over one multiplexed connection, carrying all
+    /// 4 cores (`keys`, `feed`, `blobKeys`, `blobs`).
     async fn connected_writer_and_reader() -> Result<(Peer, Peer), Box<dyn std::error::Error>> {
         let store_a = Corestore::new_mem().await;
         let store_b = Corestore::new_mem().await;
         let writer = Peer::writer(&store_a, "feed").await?;
 
-        let (keys_a_to_b, keys_b_to_a) = create_connected_streams();
-        writer.add_keys_stream(keys_a_to_b).await?;
-        let reader = Peer::reader(&store_b, writer.keys_core_public_key(), keys_b_to_a).await?;
-
-        let (feed_a_to_b, feed_b_to_a) = create_connected_streams();
-        writer.add_stream(feed_a_to_b).await?;
-        reader.add_stream(feed_b_to_a).await?;
-
-        let (blob_keys_a_to_b, blob_keys_b_to_a) = create_connected_streams();
-        writer.add_blob_keys_stream(blob_keys_a_to_b).await?;
-        reader.add_blob_keys_stream(blob_keys_b_to_a).await?;
-
-        let (blobs_a_to_b, blobs_b_to_a) = create_connected_streams();
-        writer.add_blobs_stream(blobs_a_to_b).await?;
-        reader.add_blobs_stream(blobs_b_to_a).await?;
+        let (a_to_b, b_to_a) = create_connected_streams();
+        writer.add_stream(a_to_b).await?;
+        let reader = Peer::reader(&store_b, writer.keys_core_public_key(), b_to_a).await?;
 
         Ok((writer, reader))
     }
