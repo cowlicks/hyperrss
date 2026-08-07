@@ -19,7 +19,7 @@ path = "../bee"
 default-features = false
 
 [dependencies.hypercore]
-path = "../core"
+version = "0.17.0-alpha.1"
 default-features = false
 features = ["sparse", "replication"]
 
