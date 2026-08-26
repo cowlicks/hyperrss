@@ -24,7 +24,7 @@ use hypercore_handshake::CipherTrait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{feed::FeedError, KeyedBlobs, KeyedBlobsError, OrderedHyperbee};
+use crate::{KeyedBlobs, KeyedBlobsError, OrderedHyperbee, feed::FeedError};
 
 /// Errors produced by [`Peer`].
 #[derive(Error, Debug)]
@@ -45,9 +45,16 @@ pub enum PeerError {
     /// An error from the `keys` core itself.
     #[error("error from the keys core: {0}")]
     Hypercore(#[from] hypercore::HypercoreError),
-    /// The `keys` core's bootstrap entry failed to decode as JSON.
-    #[error("error decoding the keys entry: {0}")]
-    KeysEntryDecode(#[from] serde_json::Error),
+    /// JSON encoding or decoding failed — reading the `keys` core's bootstrap entry, or storing
+    /// a feed item or metadata value.
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+    /// A write was attempted on a peer that doesn't hold the feed's secret key.
+    #[error("this peer is not a writer: it does not hold the feed's secret key")]
+    NotAWriter,
+    /// No feed key could be derived for the item at this index (by default, it had no `guid`).
+    #[error("the item at index [{0}] has no key")]
+    ItemMissingKey(usize),
     /// A public key in the `keys` entry wasn't validly `base64url`-encoded.
     #[error("error decoding a public key: {0}")]
     KeyEncoding(#[from] data_encoding::DecodeError),
@@ -93,7 +100,9 @@ fn encode_key(key: &VerifyingKey) -> String {
 
 fn decode_key(s: &str) -> Result<VerifyingKey, PeerError> {
     let bytes = data_encoding::BASE64URL_NOPAD.decode(s.as_bytes())?;
-    let bytes: [u8; 32] = bytes.try_into().map_err(|_| PeerError::InvalidPublicKeyLength)?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| PeerError::InvalidPublicKeyLength)?;
     Ok(VerifyingKey::from_bytes(&bytes)?)
 }
 
@@ -156,7 +165,14 @@ impl Peer {
             keys_core.append(&bytes).await?;
         }
 
-        Self::from_hypercores(store.clone(), feed_hc, blob_keys_hc, blobs_hc, keys_core, keys)
+        Self::from_hypercores(
+            store.clone(),
+            feed_hc,
+            blob_keys_hc,
+            blobs_hc,
+            keys_core,
+            keys,
+        )
     }
 
     /// Bootstrap a reader from just the `keys` core's public key: opens that core, starts
@@ -188,7 +204,14 @@ impl Peer {
         let blob_keys_hc = store.get_from_verifying_key(&keys.blob_keys).await?;
         let blobs_hc = store.get_from_verifying_key(&keys.blobs).await?;
 
-        Self::from_hypercores(store.clone(), feed_hc, blob_keys_hc, blobs_hc, keys_core, keys)
+        Self::from_hypercores(
+            store.clone(),
+            feed_hc,
+            blob_keys_hc,
+            blobs_hc,
+            keys_core,
+            keys,
+        )
     }
 
     fn from_hypercores(
@@ -255,11 +278,11 @@ impl Peer {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
     use hypercore_handshake::{
-        state_machine::{hc_specific::generate_keypair, SecStream},
         Cipher,
+        state_machine::{SecStream, hc_specific::generate_keypair},
     };
     use tokio_util::compat::TokioAsyncReadCompatExt;
     use uint24le_framing::Uint24LELengthPrefixedFraming;
@@ -284,7 +307,8 @@ mod test {
 
     /// Connect a fresh writer and reader `Peer` over one multiplexed connection, carrying all
     /// 4 cores (`keys`, `feed`, `blobKeys`, `blobs`).
-    async fn connected_writer_and_reader() -> Result<(Peer, Peer), Box<dyn std::error::Error>> {
+    pub(crate) async fn connected_writer_and_reader()
+    -> Result<(Peer, Peer), Box<dyn std::error::Error>> {
         let store_a = Corestore::new_mem().await;
         let store_b = Corestore::new_mem().await;
         let writer = Peer::writer(&store_a, "feed").await?;

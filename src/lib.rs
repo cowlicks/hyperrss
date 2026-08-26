@@ -13,9 +13,13 @@
 
 mod const_;
 mod feed;
+mod item;
 mod keyed_blobs;
 mod peer;
+mod writer;
 
 pub use feed::{FeedEntry, FeedError, OrderedHyperbee};
+pub use item::{ParsedFeed, RssItem, DEFAULT_KEY_FIELD};
 pub use keyed_blobs::{KeyedBlobs, KeyedBlobsError};
 pub use peer::{Peer, PeerError};
+pub use writer::NewItem;
