@@ -32,7 +32,18 @@ path = "../corestore"
 [dependencies.hyperblobs]
 path = "../blobs"
 
+[dependencies.hyperswarm]
+path = "../hyperswarm/swarm"
+
+# For `discovery_key`: the swarm topic a feed is announced under. Same registry version
+# `core` and `corestore` resolve, so it is the same crate instance.
+[dependencies.hypercore-protocol]
+version = "0.7.2"
+
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 uint24le_framing = "0.2.0"
+# For the in-process bootstrap DHT the swarm integration test and examples run against.
+hyperdht = { path = "../hyperswarm/hdht" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

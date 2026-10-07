@@ -16,10 +16,17 @@ mod feed;
 mod item;
 mod keyed_blobs;
 mod peer;
+mod swarm;
 mod writer;
 
 pub use feed::{FeedEntry, FeedError, OrderedHyperbee};
 pub use item::{ParsedFeed, RssItem, DEFAULT_KEY_FIELD};
 pub use keyed_blobs::{KeyedBlobs, KeyedBlobsError};
-pub use peer::{Peer, PeerError};
+pub use peer::{
+    Peer, PeerError, PeerKeys, decode_public_key, encode_public_key, topic_for_keys_core,
+};
+pub use swarm::DiscoveryOptions;
+// Re-exported so downstream crates can build and configure a swarm without depending on
+// `hyperswarm` themselves.
+pub use hyperswarm::{DhtConfig, Swarm, SwarmConfig, Topic};
 pub use writer::NewItem;

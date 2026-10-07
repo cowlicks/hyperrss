@@ -15,12 +15,13 @@
 //! *after* the connection is already running (once it learns their keys from the `keys` core),
 //! and they still attach to that same connection automatically.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use corestore::Corestore;
 use hyperbee::Hyperbee;
 use hypercore::{Hypercore, PartialKeypair, VerifyingKey};
 use hypercore_handshake::CipherTrait;
+use hyperswarm::Topic;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -45,6 +46,27 @@ pub enum PeerError {
     /// An error from the `keys` core itself.
     #[error("error from the keys core: {0}")]
     Hypercore(#[from] hypercore::HypercoreError),
+    /// An error from the swarm, or from the DHT underneath it.
+    #[error("error from hyperswarm: {0}")]
+    Swarm(#[from] hyperswarm::Error),
+    /// Gave up waiting for a peer to supply the `keys` core's bootstrap entry. JS's equivalent
+    /// is `reader.js`'s "Could not connect to the writer peer".
+    ///
+    /// `peers` separates the two failure modes: `0` means nobody announcing this feed's topic
+    /// was ever reached, anything higher means a peer connected but never served block 0.
+    #[error(
+        "timed out after {elapsed:?} waiting for the writer's keys entry \
+         ({peers} peer(s) replicating the keys core)"
+    )]
+    DiscoveryTimeout {
+        /// How long the wait lasted.
+        elapsed: Duration,
+        /// Peers replicating the `keys` core when the wait was abandoned.
+        peers: usize,
+    },
+    /// A writer gave up waiting for its first DHT announce round to complete.
+    #[error("timed out after {0:?} announcing this feed on the DHT")]
+    AnnounceTimeout(Duration),
     /// JSON encoding or decoding failed — reading the `keys` core's bootstrap entry, or storing
     /// a feed item or metadata value.
     #[error("json error: {0}")]
@@ -94,11 +116,15 @@ struct KeysEntry {
     keys: RawPeerKeys,
 }
 
-fn encode_key(key: &VerifyingKey) -> String {
+/// `base64url`-encode a public key. This is the string form of a feed address: what
+/// [`Peer::feed_id`] returns and what a reader is given (JS: `encodedStrFromBuffer`, and what
+/// `writer.js`'s `discoveryKeyString()` returns).
+pub fn encode_public_key(key: &VerifyingKey) -> String {
     data_encoding::BASE64URL_NOPAD.encode(key.as_bytes())
 }
 
-fn decode_key(s: &str) -> Result<VerifyingKey, PeerError> {
+/// Decode a `base64url` feed address back into a public key (JS: `bufferFromEncodedStr`).
+pub fn decode_public_key(s: &str) -> Result<VerifyingKey, PeerError> {
     let bytes = data_encoding::BASE64URL_NOPAD.decode(s.as_bytes())?;
     let bytes: [u8; 32] = bytes
         .try_into()
@@ -106,12 +132,24 @@ fn decode_key(s: &str) -> Result<VerifyingKey, PeerError> {
     Ok(VerifyingKey::from_bytes(&bytes)?)
 }
 
+/// The DHT topic a feed is announced under: the `keys` core's *discovery key*, derived from
+/// its *public key* (JS: `keysCore.discoveryKey`).
+///
+/// The two are deliberately different. The public key is what users share and what grants
+/// read access; the discovery key is a one-way hash of it, so announcing on the DHT does not
+/// hand the feed's contents to anyone watching the DHT.
+pub fn topic_for_keys_core(keys_core_public_key: &VerifyingKey) -> Topic {
+    Topic(hypercore_protocol::discovery_key(
+        keys_core_public_key.as_bytes(),
+    ))
+}
+
 impl From<&PeerKeys> for RawPeerKeys {
     fn from(keys: &PeerKeys) -> Self {
         Self {
-            feed: encode_key(&keys.feed),
-            blob_keys: encode_key(&keys.blob_keys),
-            blobs: encode_key(&keys.blobs),
+            feed: encode_public_key(&keys.feed),
+            blob_keys: encode_public_key(&keys.blob_keys),
+            blobs: encode_public_key(&keys.blobs),
         }
     }
 }
@@ -121,9 +159,9 @@ impl TryFrom<RawPeerKeys> for PeerKeys {
 
     fn try_from(raw: RawPeerKeys) -> Result<Self, PeerError> {
         Ok(Self {
-            feed: decode_key(&raw.feed)?,
-            blob_keys: decode_key(&raw.blob_keys)?,
-            blobs: decode_key(&raw.blobs)?,
+            feed: decode_public_key(&raw.feed)?,
+            blob_keys: decode_public_key(&raw.blob_keys)?,
+            blobs: decode_public_key(&raw.blobs)?,
         })
     }
 }
@@ -139,6 +177,8 @@ pub struct Peer {
     is_writer: bool,
     feed: OrderedHyperbee,
     keyed_blobs: KeyedBlobs,
+    /// Set only by the `*_with_swarm` constructors; see [`crate::swarm`].
+    pub(crate) discovery: Option<crate::swarm::Discovery>,
 }
 
 impl Peer {
@@ -192,14 +232,18 @@ impl Peer {
         // TODO(spawn): tracked in ../../TODO.md alongside the other `add_stream` spawn sites.
         tokio::spawn(store.replicate(stream));
 
-        let keys = loop {
-            if let Some(bytes) = keys_core.get(0).await? {
-                let entry: KeysEntry = serde_json::from_slice(&bytes)?;
-                break PeerKeys::try_from(entry.keys)?;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        };
+        let keys = await_keys_entry(&keys_core, None, Duration::MAX, || {}).await?;
+        Self::from_keys(store, keys_core, keys).await
+    }
 
+    /// Open the `feed`/`blobKeys`/`blobs` cores named by a bootstrap entry just read off the
+    /// `keys` core. They attach to the already-running connection automatically, so this
+    /// needs no stream of its own.
+    pub(crate) async fn from_keys(
+        store: &Corestore,
+        keys_core: Hypercore,
+        keys: PeerKeys,
+    ) -> Result<Self, PeerError> {
         let feed_hc = store.get_from_verifying_key(&keys.feed).await?;
         let blob_keys_hc = store.get_from_verifying_key(&keys.blob_keys).await?;
         let blobs_hc = store.get_from_verifying_key(&keys.blobs).await?;
@@ -231,6 +275,7 @@ impl Peer {
             keys,
             keys_core,
             is_writer,
+            discovery: None,
             feed,
             keyed_blobs,
         })
@@ -274,6 +319,47 @@ impl Peer {
     /// The peer's keyed blobs store.
     pub fn keyed_blobs(&self) -> &KeyedBlobs {
         &self.keyed_blobs
+    }
+}
+
+/// How often to re-check whether the `keys` core's bootstrap entry has arrived.
+///
+/// `Hypercore::get` does not block when the block is missing and no replicator is attached:
+/// it resolves `Ok(None)` straight away. So discovering that block 0 has landed means asking
+/// again, rather than awaiting a single future.
+const KEYS_ENTRY_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Wait for the writer's bootstrap entry on the `keys` core and decode it (JS: `reader.js`'s
+/// `keysCore.get(0)`).
+///
+/// `deadline` of `None` waits forever, which is what [`Peer::reader`] does: its caller already
+/// supplied a live connection, so there is nothing to re-try. `refresh` is called every
+/// `lookup_interval` while waiting, which is how the swarm path re-issues its DHT lookup; see
+/// [`Peer::reader_with_swarm`] for why that is necessary.
+pub(crate) async fn await_keys_entry(
+    keys_core: &Hypercore,
+    deadline: Option<Instant>,
+    lookup_interval: Duration,
+    mut refresh: impl FnMut(),
+) -> Result<PeerKeys, PeerError> {
+    let start = Instant::now();
+    let mut last_refresh = Instant::now();
+    loop {
+        if let Some(bytes) = keys_core.get(0).await? {
+            let entry: KeysEntry = serde_json::from_slice(&bytes)?;
+            return PeerKeys::try_from(entry.keys);
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(PeerError::DiscoveryTimeout {
+                elapsed: start.elapsed(),
+                peers: keys_core.peer_count(),
+            });
+        }
+        if last_refresh.elapsed() >= lookup_interval {
+            refresh();
+            last_refresh = Instant::now();
+        }
+        tokio::time::sleep(KEYS_ENTRY_POLL_INTERVAL).await;
     }
 }
 
