@@ -324,9 +324,9 @@ impl Peer {
 
 /// How often to re-check whether the `keys` core's bootstrap entry has arrived.
 ///
-/// `Hypercore::get` does not block when the block is missing and no replicator is attached:
-/// it resolves `Ok(None)` straight away. So discovering that block 0 has landed means asking
-/// again, rather than awaiting a single future.
+/// `Hypercore::get` resolves `Ok(None)` straight away while no peer is replicating the core,
+/// and once one is, waits for the block for as long as it takes. Neither suits a wait with a
+/// deadline, so each `get` is bounded by this interval and then asked again.
 const KEYS_ENTRY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Wait for the writer's bootstrap entry on the `keys` core and decode it (JS: `reader.js`'s
@@ -345,7 +345,10 @@ pub(crate) async fn await_keys_entry(
     let start = Instant::now();
     let mut last_refresh = Instant::now();
     loop {
-        if let Some(bytes) = keys_core.get(0).await? {
+        let block_zero = tokio::time::timeout(KEYS_ENTRY_POLL_INTERVAL, keys_core.get(0))
+            .await
+            .unwrap_or(Ok(None))?;
+        if let Some(bytes) = block_zero {
             let entry: KeysEntry = serde_json::from_slice(&bytes)?;
             return PeerKeys::try_from(entry.keys);
         }
