@@ -394,6 +394,28 @@ pub(crate) mod test {
         (initiator, responder)
     }
 
+    /// How long [`wait_until`] waits for something to replicate before failing.
+    const REPLICATION_BUDGET: Duration = Duration::from_secs(5);
+
+    /// Polls `condition` until it holds. Fails on its first error rather than retrying: once
+    /// replication is attached, reads wait for blocks instead of failing on them, so an error
+    /// here is a real bug (retrying on errors is what hid the `get` bug fixed in core
+    /// `5b6ba0f`).
+    pub(crate) async fn wait_until(
+        what: &str,
+        mut condition: impl AsyncFnMut() -> Result<bool, Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let start = Instant::now();
+        while !condition().await? {
+            assert!(
+                start.elapsed() < REPLICATION_BUDGET,
+                "timed out after {REPLICATION_BUDGET:?} waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Ok(())
+    }
+
     /// Connect a fresh writer and reader `Peer` over one multiplexed connection, carrying all
     /// 4 cores (`keys`, `feed`, `blobKeys`, `blobs`).
     pub(crate) async fn connected_writer_and_reader()
@@ -433,18 +455,10 @@ pub(crate) mod test {
 
         writer.feed().put_ordered_item(b"hello", b"world").await?;
 
-        let mut n_loops = 0;
-        loop {
-            if let Ok(true) = reader.feed().has_key(b"hello").await {
-                break;
-            }
-            if n_loops > 25 {
-                panic!("reader never saw the writer's item");
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            n_loops += 1;
-        }
-        Ok(())
+        wait_until("the writer's item to replicate", async || {
+            Ok(reader.feed().has_key(b"hello").await?)
+        })
+        .await
     }
 
     #[tokio::test]
@@ -456,18 +470,14 @@ pub(crate) mod test {
             .put(b"picture.png", b"not really a png")
             .await?;
 
-        let mut n_loops = 0;
-        loop {
-            if let Ok(Some(blob)) = reader.keyed_blobs().get(b"picture.png").await {
-                assert_eq!(blob, b"not really a png");
-                break;
-            }
-            if n_loops > 25 {
-                panic!("reader never saw the writer's blob");
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            n_loops += 1;
-        }
+        wait_until("the writer's blob to replicate", async || {
+            Ok(reader.keyed_blobs().get(b"picture.png").await?.is_some())
+        })
+        .await?;
+        assert_eq!(
+            reader.keyed_blobs().get(b"picture.png").await?,
+            Some(b"not really a png".to_vec())
+        );
         Ok(())
     }
 }

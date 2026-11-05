@@ -144,14 +144,12 @@ impl Peer {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
-
     use corestore::Corestore;
     use futures_lite::StreamExt;
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::peer::test::connected_writer_and_reader;
+    use crate::peer::test::{connected_writer_and_reader, wait_until};
 
     /// A feed of `guid`-keyed items, newest first, as `rss-parser` would yield them.
     fn feed_of(guids: &[&str]) -> ParsedFeed {
@@ -359,17 +357,10 @@ mod test {
         feed.insert_field("title", json!("My feed"));
         writer.update_feed(&feed).await?;
 
-        let mut n_loops = 0;
-        loop {
-            if let Ok(true) = reader.feed().has_key(b"newest").await {
-                break;
-            }
-            if n_loops > 25 {
-                panic!("reader never saw the writer's items");
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            n_loops += 1;
-        }
+        wait_until("the writer's items to replicate", async || {
+            Ok(reader.feed().has_key(b"newest").await?)
+        })
+        .await?;
 
         assert_eq!(stored_keys(&reader).await?, vec!["newest", "oldest"]);
         let title = reader.feed().get_metadata_value(b"title").await?;

@@ -23,26 +23,19 @@ const BUDGET: Duration = Duration::from_secs(30);
 
 /// Poll `f` until it reports true, or fail having waited [`BUDGET`].
 ///
-/// An error counts as "not yet, keep waiting", because mid-replication it usually is one:
-/// reading a hyperbee whose blocks are still arriving fails with `NoBlockAtSeqError` rather
-/// than reporting the key absent. The existing in-memory tests swallow it the same way
-/// (`src/peer.rs`'s `if let Ok(true)`). The last error is kept so a genuine timeout says
-/// what was actually going wrong.
+/// Fails on `f`'s first error rather than retrying. Reads used to fail mid-replication with
+/// `NoBlockAtSeqError` and were retried here; that was a core bug (`get` not waiting for a
+/// block, fixed in core `5b6ba0f`), and retrying on errors is what hid it.
 async fn until(what: &str, mut f: impl AsyncFnMut() -> Result<bool>) -> Result<()> {
     let start = Instant::now();
-    let mut last_err = None;
-    while start.elapsed() < BUDGET {
-        match f().await {
-            Ok(true) => return Ok(()),
-            Ok(false) => last_err = None,
-            Err(e) => last_err = Some(e),
-        }
+    while !f().await? {
+        assert!(
+            start.elapsed() < BUDGET,
+            "timed out after {BUDGET:?} waiting for {what}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    match last_err {
-        Some(e) => panic!("timed out after {BUDGET:?} waiting for {what}; last error: {e}"),
-        None => panic!("timed out after {BUDGET:?} waiting for {what}"),
-    }
+    Ok(())
 }
 
 /// Start an isolated DHT and return the address to bootstrap against.
