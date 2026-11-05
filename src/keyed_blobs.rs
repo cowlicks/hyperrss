@@ -4,14 +4,12 @@
 //! a `blobs` [`Hyperblobs`] (the raw, block-chunked byte storage the id points into). `blobKeys`
 //! never holds blob bytes, only the id needed to locate them in `blobs`.
 
-use corestore::Corestore;
 use futures_lite::{Stream, StreamExt};
 use hyperbee::{traverse::TraverseConfig, Hyperbee, HyperbeeError};
 use hyperblobs::{
     GetOptions, Hyperblobs, HyperblobsBuilder, HyperblobsBuilderError, PutBlob, PutOptions,
 };
 use hypercore::Hypercore;
-use hypercore_handshake::CipherTrait;
 use thiserror::Error;
 
 /// Errors produced by [`KeyedBlobs`].
@@ -27,9 +25,6 @@ pub enum KeyedBlobsError {
     /// An error building [`Hyperblobs`].
     #[error("error building hyperblobs: {0}")]
     HyperblobsBuilder(#[from] HyperblobsBuilderError),
-    /// An error from [`Corestore`].
-    #[error("error from corestore: {0}")]
-    Corestore(#[from] corestore::Error),
     /// A stored blob id failed to decode as JSON.
     #[error("error decoding blob id for key {0:?}: {1}")]
     Decode(Vec<u8>, serde_json::Error),
@@ -52,30 +47,6 @@ impl KeyedBlobs {
         let keys = Hyperbee::from_hypercore(blob_keys)?;
         let blobs = HyperblobsBuilder::default().core(blobs).build()?;
         Ok(Self { keys, blobs })
-    }
-
-    /// Open the `blobKeys` and `blobs` cores (named `"blobKeys"` and `"blobs"`) from `store`,
-    /// creating them if they don't exist yet.
-    pub async fn from_corestore(store: &Corestore) -> Result<Self, KeyedBlobsError> {
-        let blob_keys = store.get_from_name("blobKeys").await?;
-        let blobs = store.get_from_name("blobs").await?;
-        Self::from_hypercores(blob_keys, blobs)
-    }
-
-    /// Add a replication stream for the `blobKeys` core.
-    pub async fn add_blob_keys_stream(
-        &self,
-        stream: impl CipherTrait + 'static,
-    ) -> Result<(), KeyedBlobsError> {
-        Ok(self.keys.add_stream(stream).await?)
-    }
-
-    /// Add a replication stream for the `blobs` core.
-    pub async fn add_blobs_stream(
-        &self,
-        stream: impl CipherTrait + 'static,
-    ) -> Result<(), KeyedBlobsError> {
-        Ok(self.blobs.add_stream(stream).await?)
     }
 
     fn decode_id(key: &[u8], value: Option<Vec<u8>>) -> Result<PutBlob, KeyedBlobsError> {
